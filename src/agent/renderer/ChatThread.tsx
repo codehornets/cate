@@ -312,7 +312,7 @@ function ThinkingBlock({ text, streaming }: { text: string; streaming: boolean }
     <div className="text-[12px] cate-fade-in">
       <button
         onClick={() => setExpanded((v) => !v)}
-        className="w-full flex items-center gap-1.5 text-left text-muted hover:text-primary"
+        className="w-full flex items-center gap-1.5 text-left text-muted"
       >
         <span className={streaming ? 'cate-notif-pulse' : ''}>Thinking</span>
       </button>
