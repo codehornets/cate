@@ -171,6 +171,8 @@ export function useDockTabActions(params: DockTabActionsParams) {
           ]
         : []
       const id = await window.electronAPI.showContextMenu([
+        { id: 'rename', label: 'Rename' },
+        { type: 'separator' as const },
         { id: 'close', label: 'Close', accelerator: 'Cmd+W' },
         { id: 'close-others', label: 'Close Others', enabled: hasOthers },
         { id: 'close-right', label: 'Close to the Right', enabled: hasRight },
@@ -194,6 +196,9 @@ export function useDockTabActions(params: DockTabActionsParams) {
         return
       }
       switch (id) {
+        case 'rename':
+          if (panel) beginRename(panelId, panel.title)
+          break
         case 'close':
           onClosePanel?.(panelId)
           break
