@@ -26,8 +26,11 @@ import {
   GitPullRequest,
 } from '@phosphor-icons/react'
 import { useAppStore, pickWorktreeColor, WORKTREE_COLOR_PALETTE } from '../stores/appStore'
+import { useUIStore } from '../stores/uiStore'
 import { SidebarSectionHeader, SidebarHeaderButton } from './SidebarSectionHeader'
+import { syncWorktrees, type GitWorktree } from '../lib/worktreeSync'
 import type { WorktreeMeta } from '../../shared/types'
+import { pathKey } from '../../shared/pathUtils'
 import type { NativeContextMenuItem } from '../../shared/electron-api'
 import log from '../lib/logger'
 
@@ -39,7 +42,7 @@ import log from '../lib/logger'
  *  The worktree-add handler drops a `*` .gitignore in that folder so the
  *  checkouts never show up as untracked noise in the parent repo. */
 function worktreePathFor(repoRoot: string, branch: string): string {
-  const trimmed = repoRoot.replace(/\/+$/, '')
+  const trimmed = repoRoot.replace(/[/\\]+$/, '')
   const slug = branch.replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'wt'
   return `${trimmed}/.cate/worktrees/${slug}`
 }
@@ -52,13 +55,6 @@ function toBranchName(input: string): string {
     .replace(/\s+/g, '-')
     .replace(/[^\w./-]+/g, '')
     .replace(/^-+|-+$/g, '')
-}
-
-interface GitWorktree {
-  path: string
-  branch: string
-  isBare: boolean
-  isCurrent: boolean
 }
 
 interface WorktreeStatus {
@@ -450,6 +446,24 @@ const WorktreeCard: React.FC<{
   const [recoloring, setRecoloring] = useState(false)
   const st = humanStatus(status, primaryLabel)
 
+  // Worktree focus lens: hover highlights this branch's nodes on the canvas;
+  // clicking the row locks the lens (and frames the camera). Clicking again
+  // (or empty canvas) clears it.
+  const setHoveredWorktree = useUIStore((s) => s.setHoveredWorktree)
+  const focusWorktree = useUIStore((s) => s.focusWorktree)
+  const focusedWorktreeId = useUIStore((s) => s.focusedWorktreeId)
+  const isLensFocused = focusedWorktreeId === worktree.id
+  useEffect(() => () => setHoveredWorktree(null), [setHoveredWorktree])
+
+  const handleRowClick = useCallback(
+    (e: React.MouseEvent) => {
+      // Ignore clicks on the inline buttons / rename input.
+      if ((e.target as HTMLElement).closest('button, input')) return
+      focusWorktree(isLensFocused ? null : worktree.id)
+    },
+    [focusWorktree, isLensFocused, worktree.id],
+  )
+
   const commitRename = useCallback(() => {
     setRenaming(false)
     const next = renameValue.trim()
@@ -487,9 +501,16 @@ const WorktreeCard: React.FC<{
   }, [pr, isPrimary, primaryLabel, label, cb])
 
   return (
-    <div className="group/row" title={worktree.path}>
+    <div
+      className="group/row"
+      title={worktree.path}
+      onMouseEnter={() => setHoveredWorktree(worktree.id)}
+      onMouseLeave={() => setHoveredWorktree(null)}
+    >
       <div
-        className="flex items-center gap-1.5 h-8 px-2 hover:bg-hover transition-colors"
+        className="flex items-center gap-1.5 h-8 px-2 hover:bg-hover transition-colors cursor-pointer"
+        style={isLensFocused ? { boxShadow: `inset 2px 0 0 0 ${worktree.color}`, backgroundColor: `color-mix(in srgb, ${worktree.color} 10%, transparent)` } : undefined}
+        onClick={handleRowClick}
         onContextMenu={(e) => { e.preventDefault(); void handleMenu() }}
       >
         <button
@@ -598,7 +619,6 @@ interface ParallelWorkTabProps {
 export const ParallelWorkTab: React.FC<ParallelWorkTabProps> = ({ rootPath }) => {
   const selectedWorkspaceId = useAppStore((s) => s.selectedWorkspaceId)
   const workspace = useAppStore((s) => s.workspaces.find((w) => w.id === s.selectedWorkspaceId))
-  const ensurePrimaryWorktree = useAppStore((s) => s.ensurePrimaryWorktree)
   const upsertWorktree = useAppStore((s) => s.upsertWorktree)
   const removeWorktree = useAppStore((s) => s.removeWorktree)
   const setWorktreeColor = useAppStore((s) => s.setWorktreeColor)
@@ -627,36 +647,17 @@ export const ParallelWorkTab: React.FC<ParallelWorkTabProps> = ({ rootPath }) =>
     setRefreshing(true)
     setError(null)
     try {
-      // Parallel branches need a git repo — gate everything on that so we never
-      // fire branch/worktree commands (and log noisy errors) in a plain folder.
-      const repo = await window.electronAPI.gitIsRepo(rootPath).catch(() => false)
-      setIsRepo(repo)
-      if (!repo) return
+      // The cheap list/metadata reconcile is shared with the background sync
+      // (see worktreeSync.ts) so the store stays current even when this tab is
+      // closed. Here we additionally fetch the per-worktree status badges, which
+      // are expensive and only matter for the sidebar's own display.
+      const result = await syncWorktrees(selectedWorkspaceId)
+      if (!result) return
+      setIsRepo(result.isRepo)
+      if (!result.isRepo) return
 
-      const list = await window.electronAPI.gitWorktreeList(rootPath)
+      const list = result.gitWorktrees
       setGitWorktrees(list)
-
-      ensurePrimaryWorktree(selectedWorkspaceId)
-
-      const ws = useAppStore.getState().workspaces.find((w) => w.id === selectedWorkspaceId)
-      if (ws) {
-        const existing = ws.worktrees ?? []
-        for (const g of list) {
-          const match = existing.find((w) => w.path === g.path)
-          if (!match) {
-            const meta: WorktreeMeta = {
-              id: `wt-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-              path: g.path,
-              branch: g.branch,
-              color: pickWorktreeColor(existing),
-              isPrimary: g.path === ws.rootPath,
-            }
-            upsertWorktree(selectedWorkspaceId, meta)
-          } else if (match.branch !== g.branch) {
-            upsertWorktree(selectedWorkspaceId, { ...match, branch: g.branch })
-          }
-        }
-      }
 
       const statusEntries = await Promise.all(
         list.map(async (g) => {
@@ -681,7 +682,7 @@ export const ParallelWorkTab: React.FC<ParallelWorkTabProps> = ({ rootPath }) =>
     } finally {
       setRefreshing(false)
     }
-  }, [rootPath, selectedWorkspaceId, ensurePrimaryWorktree, upsertWorktree])
+  }, [rootPath, selectedWorkspaceId])
 
   useEffect(() => { void reconcile() }, [reconcile])
 
@@ -701,9 +702,12 @@ export const ParallelWorkTab: React.FC<ParallelWorkTabProps> = ({ rootPath }) =>
   // ---------------------------------------------------------------------------
 
   const worktrees = workspace?.worktrees ?? []
-  const gitPaths = useMemo(() => new Set(gitWorktrees.map((g) => g.path)), [gitWorktrees])
-  const orphans = worktrees.filter((w) => !w.isPrimary && !gitPaths.has(w.path))
-  const live = worktrees.filter((w) => w.isPrimary || gitPaths.has(w.path))
+  // Normalized keys: git reports forward-slash paths, stored worktrees use the
+  // native separator, so on Windows a raw Set lookup would mark every live
+  // worktree as an orphan.
+  const gitPaths = useMemo(() => new Set(gitWorktrees.map((g) => pathKey(g.path))), [gitWorktrees])
+  const orphans = worktrees.filter((w) => !w.isPrimary && !gitPaths.has(pathKey(w.path)))
+  const live = worktrees.filter((w) => w.isPrimary || gitPaths.has(pathKey(w.path)))
 
   const primaryLabel = useMemo(() => {
     const primary = worktrees.find((w) => w.isPrimary)

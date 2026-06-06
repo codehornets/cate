@@ -10,12 +10,14 @@ import { useAppStore, type PanelPlacement } from '../stores/appStore'
 import { useCanvasInteraction } from '../hooks/useCanvasInteraction'
 import { useAutoFocusLargestVisible } from '../hooks/useAutoFocusLargestVisible'
 import { useUIStore, effectiveCanvasTool } from '../stores/uiStore'
+import { useSettingsStore } from '../stores/settingsStore'
 import { canvasToView, viewToCanvas } from '../lib/canvas/coordinates'
 import CanvasGrid from './CanvasGrid'
 import CanvasBackgroundImage from './CanvasBackgroundImage'
 import SnapGuides from './SnapGuides'
 import CanvasRegionComponent from './CanvasRegionComponent'
 import GhostPlacementLayer from './GhostPlacementLayer'
+import { WorktreeTerritoryLayer } from './worktree'
 import type { Point, PanelType } from '../../shared/types'
 import { openFileAsPanel } from '../lib/fs/fileRouting'
 import { setPendingReveal } from '../lib/editor/editorReveal'
@@ -181,6 +183,8 @@ interface CanvasProps {
 const Canvas: React.FC<CanvasProps> = ({ children, onCreateAtPoint, panelId }) => {
   const canvasRef = useRef<HTMLDivElement>(null)
   const worldRef = useRef<HTMLDivElement>(null)
+  // Debounce handle for de-promoting the world layer after pan/zoom settles.
+  const willChangeResetRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const canvasApi = useCanvasStoreApi()
   const [containerSize, setContainerSize] = useState({ width: 0, height: 0 })
 
@@ -197,6 +201,7 @@ const Canvas: React.FC<CanvasProps> = ({ children, onCreateAtPoint, panelId }) =
   // overrides to 'grabbing' during an active pan and hands control back on release).
   const handToolActive = useUIStore((s) => effectiveCanvasTool(s) === 'hand')
   const idleCursor = handToolActive ? 'grab' : 'default'
+  const showWorktreeTerritory = useSettingsStore((s) => s.showWorktreeTerritory)
 
   // While the Hand tool is active, neutralize interactive panel content so a
   // left-press anywhere pans the canvas (see the .canvas-tool-hand CSS rules).
@@ -227,6 +232,19 @@ const Canvas: React.FC<CanvasProps> = ({ children, onCreateAtPoint, panelId }) =
       if (!el) return
       el.style.transform = `scale(${zoom}) translate(${offset.x / zoom}px, ${offset.y / zoom}px)`
       el.style.setProperty('--zoom', String(zoom))
+
+      // Promote the world to its own GPU layer for the duration of the gesture so
+      // pan/zoom stays smooth, then de-promote once it settles. While promoted,
+      // Chromium bitmap-scales the layer's cached texture (blurs thin SVG icon
+      // strokes); removing will-change forces a crisp re-raster at the resting
+      // transform. Debounced so it only fires after the user stops interacting.
+      el.style.willChange = 'transform'
+      if (willChangeResetRef.current) clearTimeout(willChangeResetRef.current)
+      willChangeResetRef.current = setTimeout(() => {
+        const node = worldRef.current
+        if (node) node.style.willChange = 'auto'
+        willChangeResetRef.current = null
+      }, 150)
     }
 
     // Apply current state immediately on mount
@@ -239,7 +257,10 @@ const Canvas: React.FC<CanvasProps> = ({ children, onCreateAtPoint, panelId }) =
         applyTransform(state.zoomLevel, state.viewportOffset)
       }
     })
-    return unsubscribe
+    return () => {
+      unsubscribe()
+      if (willChangeResetRef.current) clearTimeout(willChangeResetRef.current)
+    }
   }, []) // mount-only
 
   // Auto-focus the node that occupies the most visible viewport area (opt-in).
@@ -363,6 +384,8 @@ const Canvas: React.FC<CanvasProps> = ({ children, onCreateAtPoint, panelId }) =
       // Only unfocus if clicking directly on the world div, not on a child node
       if (!target.closest('[data-node-id]') && !target.closest('[data-region-id]')) {
         canvasApi.getState().unfocus()
+        // A click on empty canvas also dismisses the worktree focus lens.
+        useUIStore.getState().clearWorktreeLens()
       }
     },
     [],
@@ -599,6 +622,16 @@ const Canvas: React.FC<CanvasProps> = ({ children, onCreateAtPoint, panelId }) =
         containerHeight={containerSize.height}
       />
 
+      {/* Worktree territory — colours the grid dots per worktree. Screen-space
+          (outside the world transform), above the grid, behind all panels.
+          Opt-out via Settings → Canvas → Worktree territories. */}
+      {showWorktreeTerritory && (
+        <WorktreeTerritoryLayer
+          containerWidth={containerSize.width}
+          containerHeight={containerSize.height}
+        />
+      )}
+
       {/* World div: transformed to implement pan/zoom */}
       <div
         ref={worldRef}
@@ -609,7 +642,8 @@ const Canvas: React.FC<CanvasProps> = ({ children, onCreateAtPoint, panelId }) =
           width: 1,
           height: 1,
           transformOrigin: '0 0',
-          willChange: 'transform',
+          // will-change is toggled imperatively during pan/zoom (see applyTransform)
+          // so the layer de-promotes at rest and re-rasters icons crisply.
         }}
         onClick={handleWorldClick}
       >
